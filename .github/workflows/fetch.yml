@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'Full URL of the JS page to read'
+        description: 'Full URL of the JS page or file to read'
         required: true
         type: string
 
@@ -38,34 +38,48 @@ jobs:
                       timezone_id="America/New_York",
                   )
                   page = await ctx.new_page()
-                  print("goto", URL)
+                  print("goto", URL[:120])
                   await page.goto(URL, wait_until="domcontentloaded", timeout=90000)
 
-                  # wait for challenge/JS to settle: check if innerText is growing
                   last_len = -1
                   same = 0
                   for i in range(60):
                       await page.wait_for_timeout(5000)
                       try:
                           txt = await page.evaluate("document.body ? document.body.innerText : ''")
-                          print("tick", i, "len", len(txt), "title", (await page.title())[:50])
+                          print("tick", i, "len", len(txt))
                           if len(txt) == last_len:
                               same += 1
                           else:
                               same = 0
                           last_len = len(txt)
-                          # short-circuit: stable for 3 consecutive ticks (15s) and non-trivial
                           if same >= 3 and len(txt) > 200:
                               break
                       except Exception as e:
                           print("tick", i, "err", e)
 
-                  txt = await page.evaluate("document.body ? document.body.innerText : ''")
-                  with open("page_text.txt", "w") as f:
-                      f.write(txt)
-                  print("PAGE_TEXT_LEN", len(txt))
+                  try:
+                      txt = await page.evaluate("document.body ? document.body.innerText : ''")
+                      with open("page_text.txt", "w") as f:
+                          f.write(txt)
+                      print("PAGE_TEXT_LEN", len(txt))
+                  except Exception as e:
+                      print("text err", e)
 
-                  # try the same URL as JSON too (works for JSON APIs)
+                  # binary download of the same URL (images/files)
+                  try:
+                      resp = await ctx.request.get(URL)
+                      ct = resp.headers.get("content-type", "")
+                      print("binary fetch status", resp.status, "content-type", ct)
+                      if resp.status == 200:
+                          body = await resp.body()
+                          with open("page.bin", "wb") as f:
+                              f.write(body)
+                          print("BINARY_LEN", len(body))
+                  except Exception as e:
+                      print("binary err", e)
+
+                  # try the same URL as JSON
                   try:
                       r = await page.evaluate(
                           """async (u) => {
@@ -82,7 +96,6 @@ jobs:
                   except Exception as e:
                       print("json attempt err", e)
 
-                  # full rendered HTML backup
                   try:
                       html = await page.content()
                       with open("page.html", "w") as f:
@@ -107,4 +120,5 @@ jobs:
             page_text.txt
             page.json
             page.html
+            page.bin
           if-no-files-found: warn
