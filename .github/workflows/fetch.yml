@@ -4,27 +4,19 @@ on: workflow_dispatch
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    container:
-      image: mcr.microsoft.com/playwright/python:v1.44.0-jammy
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - name: Install playwright python package
-        run: pip install playwright==1.44.0
-
-      - name: Try plain curl first
+      - name: Setup python and patchright
         run: |
-          curl -sS --max-time 60 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
-            -H "Accept: application/json" \
-            "https://claude.ai/api/share/8e155b3f-03d5-4307-88a1-da998bffc075" \
-            -o curl.json || true
-          head -c 300 curl.json || true
+          python -m pip install --upgrade pip
+          pip install patchright
+          patchright install chromium
 
-      - name: Fetch via browser
+      - name: Fetch via stealth browser
         run: |
-          xvfb-run -a python - <<'EOF'
+          xvfb-run -a --server-args="-screen 0 1280x900x24" python - <<'EOF'
           import asyncio
-          from playwright.async_api import async_playwright
+          from patchright.async_api import async_playwright
 
           SHARE_ID = "8e155b3f-03d5-4307-88a1-da998bffc075"
 
@@ -32,23 +24,25 @@ jobs:
               async with async_playwright() as p:
                   browser = await p.chromium.launch(
                       headless=False,
-                      args=["--disable-blink-features=AutomationControlled"],
+                      channel="chromium",
                   )
                   ctx = await browser.new_context(
-                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
                       viewport={"width": 1280, "height": 900},
                       locale="en-US",
+                      timezone_id="America/New_York",
                   )
                   page = await ctx.new_page()
+                  print("goto share page...")
                   await page.goto(
                       "https://claude.ai/share/" + SHARE_ID,
                       wait_until="domcontentloaded",
-                      timeout=60000,
+                      timeout=90000,
                   )
                   data = None
-                  for i in range(30):
+                  for i in range(60):
                       await page.wait_for_timeout(5000)
                       try:
+                          title = await page.title()
                           r = await page.evaluate(
                               """async (sid) => {
                                   const resp = await fetch('/api/share/' + sid, {headers: {'Accept': 'application/json'}});
@@ -58,7 +52,7 @@ jobs:
                           )
                           body = (r or {}).get("body", "")
                           status = (r or {}).get("status")
-                          print("attempt", i, "status", status, "body[:80]", body[:80])
+                          print("attempt", i, "title", title[:40], "status", status, "body[:60]", body[:60])
                           if status == 200 and body.strip().startswith("{"):
                               data = body
                               break
@@ -71,7 +65,6 @@ jobs:
                   else:
                       print("NO_JSON_FROM_BROWSER")
                   try:
-                      await page.wait_for_timeout(3000)
                       txt = await page.evaluate("document.body ? document.body.innerText : ''")
                       with open("page_text.txt", "w") as f:
                           f.write(txt)
@@ -91,5 +84,4 @@ jobs:
           path: |
             share.json
             page_text.txt
-            curl.json
           if-no-files-found: warn
