@@ -1,0 +1,92 @@
+name: fetch-claude
+on: workflow_dispatch
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.44.0-jammy
+    timeout-minutes: 15
+    steps:
+      - name: Try plain curl first
+        run: |
+          curl -sS --max-time 60 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
+            -H "Accept: application/json" \
+            "https://claude.ai/api/share/8e155b3f-03d5-4307-88a1-da998bffc075" \
+            -o curl.json || true
+          head -c 300 curl.json || true
+
+      - name: Fetch via browser
+        run: |
+          xvfb-run -a python - <<'EOF'
+          import asyncio
+          from playwright.async_api import async_playwright
+
+          SHARE_ID = "8e155b3f-03d5-4307-88a1-da998bffc075"
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(
+                      headless=False,
+                      args=["--disable-blink-features=AutomationControlled"],
+                  )
+                  ctx = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                      viewport={"width": 1280, "height": 900},
+                      locale="en-US",
+                  )
+                  page = await ctx.new_page()
+                  await page.goto(
+                      "https://claude.ai/share/" + SHARE_ID,
+                      wait_until="domcontentloaded",
+                      timeout=60000,
+                  )
+                  data = None
+                  for i in range(30):
+                      await page.wait_for_timeout(5000)
+                      try:
+                          r = await page.evaluate(
+                              """async (sid) => {
+                                  const resp = await fetch('/api/share/' + sid, {headers: {'Accept': 'application/json'}});
+                                  return {status: resp.status, body: await resp.text()};
+                              }""",
+                              SHARE_ID,
+                          )
+                          body = (r or {}).get("body", "")
+                          status = (r or {}).get("status")
+                          print("attempt", i, "status", status, "body[:80]", body[:80])
+                          if status == 200 and body.strip().startswith("{"):
+                              data = body
+                              break
+                      except Exception as e:
+                          print("attempt", i, "err", e)
+                  if data:
+                      with open("share.json", "w") as f:
+                          f.write(data)
+                      print("GOT_JSON_LEN", len(data))
+                  else:
+                      print("NO_JSON_FROM_BROWSER")
+                  try:
+                      await page.wait_for_timeout(3000)
+                      txt = await page.evaluate("document.body ? document.body.innerText : ''")
+                      with open("page_text.txt", "w") as f:
+                          f.write(txt)
+                      print("PAGE_TEXT_LEN", len(txt))
+                  except Exception as e:
+                      print("text err", e)
+                  await browser.close()
+
+          asyncio.run(main())
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: share
+          path: |
+            share.json
+            page_text.txt
+            curl.json
+          if-no-files-found: warn
