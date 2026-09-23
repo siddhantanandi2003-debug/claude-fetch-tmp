@@ -3,32 +3,17 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'Full URL of the JS page to read'
+        description: 'Full URL of the JS page or file to read'
         required: true
-        type: string
-      connect:
-        description: 'Optional CDP websocket URL of a remote browser to control (skips local browser setup)'
-        required: false
         type: string
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    container:
+      image: ghcr.io/siddhantanandi2003-debug/fetch:latest
+    timeout-minutes: 15
     steps:
-      - name: Setup stealth browser
-        if: ${{ inputs.connect == '' }}
-        run: |
-          python -m pip install --upgrade pip
-          pip install patchright
-          patchright install chromium
-
-      - name: Setup client only
-        if: ${{ inputs.connect != '' }}
-        run: |
-          python -m pip install --upgrade pip
-          pip install patchright
-
       - name: Render page and extract text
         run: |
           xvfb-run -a --server-args="-screen 0 1280x900x24" python - <<'EOF'
@@ -36,53 +21,61 @@ jobs:
           from patchright.async_api import async_playwright
 
           URL = os.environ["PAGE_URL"]
-          CONNECT = os.environ.get("CONNECT_URL", "")
 
           async def main():
               async with async_playwright() as p:
-                  if CONNECT:
-                      browser = await p.chromium.connect_over_cdp(CONNECT, timeout=60000)
-                      ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-                      print("connected to remote browser over CDP")
-                  else:
-                      browser = await p.chromium.launch(
-                          headless=False,
-                          channel="chromium",
-                      )
-                      ctx = await browser.new_context(
-                          viewport={"width": 1280, "height": 900},
-                          locale="en-US",
-                          timezone_id="America/New_York",
-                      )
+                  browser = await p.chromium.launch(
+                      headless=False,
+                      channel="chromium",
+                  )
+                  ctx = await browser.new_context(
+                      viewport={"width": 1280, "height": 900},
+                      locale="en-US",
+                      timezone_id="America/New_York",
+                  )
                   page = await ctx.new_page()
-                  print("goto", URL)
+                  print("goto", URL[:120])
                   await page.goto(URL, wait_until="domcontentloaded", timeout=90000)
 
-                  # wait for challenge/JS to settle: check if innerText is growing
                   last_len = -1
                   same = 0
-                  for i in range(60):
-                      await page.wait_for_timeout(5000)
+                  for i in range(50):
+                      await page.wait_for_timeout(3000)
                       try:
                           txt = await page.evaluate("document.body ? document.body.innerText : ''")
-                          print("tick", i, "len", len(txt), "title", (await page.title())[:50])
+                          print("tick", i, "len", len(txt))
                           if len(txt) == last_len:
                               same += 1
                           else:
                               same = 0
                           last_len = len(txt)
-                          # short-circuit: stable for 3 consecutive ticks (15s) and non-trivial
-                          if same >= 3 and len(txt) > 200:
+                          if same >= 2 and len(txt) > 100:
                               break
                       except Exception as e:
                           print("tick", i, "err", e)
 
-                  txt = await page.evaluate("document.body ? document.body.innerText : ''")
-                  with open("page_text.txt", "w") as f:
-                      f.write(txt)
-                  print("PAGE_TEXT_LEN", len(txt))
+                  try:
+                      txt = await page.evaluate("document.body ? document.body.innerText : ''")
+                      with open("page_text.txt", "w") as f:
+                          f.write(txt)
+                      print("PAGE_TEXT_LEN", len(txt))
+                  except Exception as e:
+                      print("text err", e)
 
-                  # try the same URL as JSON too (works for JSON APIs)
+                  # binary download of the same URL (images/files)
+                  try:
+                      resp = await ctx.request.get(URL)
+                      ct = resp.headers.get("content-type", "")
+                      print("binary fetch status", resp.status, "content-type", ct)
+                      if resp.status == 200:
+                          body = await resp.body()
+                          with open("page.bin", "wb") as f:
+                              f.write(body)
+                          print("BINARY_LEN", len(body))
+                  except Exception as e:
+                      print("binary err", e)
+
+                  # try the same URL as JSON
                   try:
                       r = await page.evaluate(
                           """async (u) => {
@@ -99,7 +92,6 @@ jobs:
                   except Exception as e:
                       print("json attempt err", e)
 
-                  # full rendered HTML backup
                   try:
                       html = await page.content()
                       with open("page.html", "w") as f:
@@ -108,16 +100,12 @@ jobs:
                   except Exception as e:
                       print("html err", e)
 
-                  try:
-                      await browser.close()
-                  except Exception as e:
-                      print("close err", e)
+                  await browser.close()
 
           asyncio.run(main())
           EOF
         env:
           PAGE_URL: ${{ inputs.url }}
-          CONNECT_URL: ${{ inputs.connect }}
 
       - name: Upload results
         if: always()
@@ -128,4 +116,5 @@ jobs:
             page_text.txt
             page.json
             page.html
+            page.bin
           if-no-files-found: warn
