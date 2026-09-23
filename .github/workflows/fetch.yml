@@ -8,6 +8,9 @@ jobs:
       image: mcr.microsoft.com/playwright/python:v1.44.0-jammy
     timeout-minutes: 15
     steps:
+      - name: Install playwright python package
+        run: pip install playwright==1.44.0
+
       - name: Try plain curl first
         run: |
           curl -sS --max-time 60 \
