@@ -14,6 +14,9 @@ jobs:
       image: ghcr.io/siddhantanandi2003-debug/fetch:latest
     timeout-minutes: 15
     steps:
+      - name: Ensure browser binary
+        run: python -m patchright install chromium
+
       - name: Render page and extract text
         run: |
           xvfb-run -a --server-args="-screen 0 1280x900x24" python - <<'EOF'
