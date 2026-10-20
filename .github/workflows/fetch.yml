@@ -15,11 +15,16 @@ jobs:
       image: ghcr.io/siddhantanandi2003-debug/fetch:latest
     timeout-minutes: 15
     steps:
-      # The custom image has no repo checkout, so pull the fetcher script directly.
+      # The custom image is python:3.11-slim with NO curl/git, so fetch the
+      # script with python's urllib (python is always present in the image).
       - name: Get fetcher script
         run: |
-          curl -fsSL https://raw.githubusercontent.com/siddhantanandi2003-debug/claude-fetch-tmp/main/fetch_page.py -o fetch_page.py
-          echo "script bytes: $(wc -c < fetch_page.py)"
+          python - <<'PY'
+          import urllib.request, os
+          url = "https://raw.githubusercontent.com/siddhantanandi2003-debug/claude-fetch-tmp/main/fetch_page.py"
+          urllib.request.urlretrieve(url, "fetch_page.py")
+          print("script bytes:", os.path.getsize("fetch_page.py"))
+          PY
 
       - name: Ensure browser binary
         run: python -m patchright install chromium
@@ -32,6 +37,7 @@ jobs:
 
       # -------- ROUTE 2: ZenRows premium proxy, only if Route 1 was not OK --------
       # Needs a repo secret ZENROWS_API_KEY (Settings > Secrets and variables > Actions).
+      # Uses python urllib (no curl in this image).
       - name: Fallback route (ZenRows) if Route 1 failed
         if: always()
         env:
@@ -49,24 +55,28 @@ jobs:
             exit 0
           fi
           echo "Route 1 = $status — trying Route 2 (ZenRows premium proxy)..."
-          curl -fsS --max-time 150 -G "https://api.zenrows.com/v1/" \
-            --data-urlencode "apikey=$ZENROWS_API_KEY" \
-            --data-urlencode "url=$PAGE_URL" \
-            --data-urlencode "js_render=true" \
-            --data-urlencode "premium_proxy=true" \
-            --data-urlencode "response_type=plaintext" \
-            --data-urlencode "wait=8000" \
-            -o page_text.txt || echo "::warning::ZenRows fallback request failed"
           python - <<'PY'
-          import json, os
-          n = os.path.getsize('page_text.txt') if os.path.exists('page_text.txt') else 0
-          json.dump(
-              {"status": "OK" if n >= 200 else "EMPTY",
-               "detail": "ZenRows premium-proxy fallback",
-               "route": "zenrows",
-               "bytes": n},
-              open('fetch_status.json', 'w'), indent=2,
-          )
+          import json, os, urllib.parse, urllib.request
+          url = os.environ["PAGE_URL"]
+          key = os.environ.get("ZENROWS_API_KEY", "")
+          n = 0
+          try:
+              qs = urllib.parse.urlencode({
+                  "apikey": key, "url": url, "js_render": "true",
+                  "premium_proxy": "true", "response_type": "plaintext", "wait": "8000",
+              })
+              req = urllib.request.Request("https://api.zenrows.com/v1/?" + qs)
+              with urllib.request.urlopen(req, timeout=150) as r:
+                  data = r.read()
+              with open("page_text.txt", "wb") as f:
+                  f.write(data)
+              n = len(data)
+          except Exception as e:
+              print("zenrows fallback err:", type(e).__name__, e)
+          with open("fetch_status.json", "w") as f:
+              json.dump({"status": "OK" if n >= 200 else "EMPTY",
+                         "detail": "ZenRows premium-proxy fallback",
+                         "route": "zenrows", "bytes": n}, f, indent=2)
           print("fallback bytes:", n)
           PY
 
