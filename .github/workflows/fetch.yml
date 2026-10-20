@@ -1,9 +1,10 @@
 name: fetch-js-page
+
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'Full URL of the JS page or file to read'
+        description: 'Full URL of the JS page / share link / file to read'
         required: true
         type: string
 
@@ -14,101 +15,72 @@ jobs:
       image: ghcr.io/siddhantanandi2003-debug/fetch:latest
     timeout-minutes: 15
     steps:
+      # The custom image has no repo checkout, so pull the fetcher script directly.
+      - name: Get fetcher script
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/siddhantanandi2003-debug/claude-fetch-tmp/main/fetch_page.py -o fetch_page.py
+          echo "script bytes: $(wc -c < fetch_page.py)"
+
       - name: Ensure browser binary
         run: python -m patchright install chromium
 
-      - name: Render page and extract text
-        run: |
-          xvfb-run -a --server-args="-screen 0 1280x900x24" python - <<'EOF'
-          import asyncio, os
-          from patchright.async_api import async_playwright
-
-          URL = os.environ["PAGE_URL"]
-
-          async def main():
-              async with async_playwright() as p:
-                  browser = await p.chromium.launch(
-                      headless=False,
-                      channel="chromium",
-                  )
-                  ctx = await browser.new_context(
-                      viewport={"width": 1280, "height": 900},
-                      locale="en-US",
-                      timezone_id="America/New_York",
-                  )
-                  page = await ctx.new_page()
-                  print("goto", URL[:120])
-                  await page.goto(URL, wait_until="domcontentloaded", timeout=90000)
-
-                  last_len = -1
-                  same = 0
-                  for i in range(50):
-                      await page.wait_for_timeout(3000)
-                      try:
-                          txt = await page.evaluate("document.body ? document.body.innerText : ''")
-                          print("tick", i, "len", len(txt))
-                          if len(txt) == last_len:
-                              same += 1
-                          else:
-                              same = 0
-                          last_len = len(txt)
-                          if same >= 2 and len(txt) > 100:
-                              break
-                      except Exception as e:
-                          print("tick", i, "err", e)
-
-                  try:
-                      txt = await page.evaluate("document.body ? document.body.innerText : ''")
-                      with open("page_text.txt", "w") as f:
-                          f.write(txt)
-                      print("PAGE_TEXT_LEN", len(txt))
-                  except Exception as e:
-                      print("text err", e)
-
-                  # binary download of the same URL (images/files)
-                  try:
-                      resp = await ctx.request.get(URL)
-                      ct = resp.headers.get("content-type", "")
-                      print("binary fetch status", resp.status, "content-type", ct)
-                      if resp.status == 200:
-                          body = await resp.body()
-                          with open("page.bin", "wb") as f:
-                              f.write(body)
-                          print("BINARY_LEN", len(body))
-                  except Exception as e:
-                      print("binary err", e)
-
-                  # try the same URL as JSON
-                  try:
-                      r = await page.evaluate(
-                          """async (u) => {
-                              const resp = await fetch(u, {headers: {'Accept': 'application/json'}});
-                              return {status: resp.status, body: await resp.text()};
-                          }""",
-                          URL,
-                      )
-                      body = (r or {}).get("body", "")
-                      if (r or {}).get("status") == 200 and body.strip().startswith("{"):
-                          with open("page.json", "w") as f:
-                              f.write(body)
-                          print("GOT_JSON_LEN", len(body))
-                  except Exception as e:
-                      print("json attempt err", e)
-
-                  try:
-                      html = await page.content()
-                      with open("page.html", "w") as f:
-                          f.write(html)
-                      print("PAGE_HTML_LEN", len(html))
-                  except Exception as e:
-                      print("html err", e)
-
-                  await browser.close()
-
-          asyncio.run(main())
-          EOF
+      # -------- ROUTE 1: stealth browser (patchright, non-headless under xvfb) --------
+      - name: Render page and extract text (Route 1)
+        run: xvfb-run -a --server-args="-screen 0 1280x900x24" python fetch_page.py
         env:
           PAGE_URL: ${{ inputs.url }}
+
+      # -------- ROUTE 2: ZenRows premium proxy, only if Route 1 was not OK --------
+      # Needs a repo secret ZENROWS_API_KEY (Settings > Secrets and variables > Actions).
+      - name: Fallback route (ZenRows) if Route 1 failed
+        if: always()
+        env:
+          PAGE_URL: ${{ inputs.url }}
+          ZENROWS_API_KEY: ${{ secrets.ZENROWS_API_KEY }}
+        run: |
+          status=$(python -c "import json;print(json.load(open('fetch_status.json'))['status'])" 2>/dev/null || echo UNKNOWN)
+          echo "Route 1 verdict: $status"
+          if [ "$status" = "OK" ]; then
+            echo "Route 1 OK — skipping fallback."
+            exit 0
+          fi
+          if [ -z "$ZENROWS_API_KEY" ]; then
+            echo "::warning title=No fallback::Route 1 = $status, but ZENROWS_API_KEY secret is not set."
+            exit 0
+          fi
+          echo "Route 1 = $status — trying Route 2 (ZenRows premium proxy)..."
+          curl -fsS --max-time 150 -G "https://api.zenrows.com/v1/" \
+            --data-urlencode "apikey=$ZENROWS_API_KEY" \
+            --data-urlencode "url=$PAGE_URL" \
+            --data-urlencode "js_render=true" \
+            --data-urlencode "premium_proxy=true" \
+            --data-urlencode "response_type=plaintext" \
+            --data-urlencode "wait=8000" \
+            -o page_text.txt || echo "::warning::ZenRows fallback request failed"
+          python - <<'PY'
+          import json, os
+          n = os.path.getsize('page_text.txt') if os.path.exists('page_text.txt') else 0
+          json.dump(
+              {"status": "OK" if n >= 200 else "EMPTY",
+               "detail": "ZenRows premium-proxy fallback",
+               "route": "zenrows",
+               "bytes": n},
+              open('fetch_status.json', 'w'), indent=2,
+          )
+          print("fallback bytes:", n)
+          PY
+
+      - name: Report verdict (fail loud if BOTH routes failed)
+        if: always()
+        run: |
+          echo "----- fetch_status.json -----"
+          cat fetch_status.json 2>/dev/null || echo "(no status file)"
+          status=$(python -c "import json;print(json.load(open('fetch_status.json'))['status'])" 2>/dev/null || echo UNKNOWN)
+          echo "FINAL_VERDICT=$status"
+          if [ "$status" != "OK" ]; then
+            echo "::warning title=Fetch not OK::both routes failed, status=$status"
+            exit 1
+          fi
 
       - name: Upload results
         if: always()
@@ -120,4 +92,5 @@ jobs:
             page.json
             page.html
             page.bin
+            fetch_status.json
           if-no-files-found: warn
